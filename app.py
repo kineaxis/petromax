@@ -1,0 +1,1161 @@
+"""
+Petromax AI — Contract & Cost Assurance Platform
+=================================================
+Dual-mode audit tool:
+  • Contract Assurance  — PDF contract risk analysis with risk-tier dashboard
+  • Cost Assurance      — Invoice deduplication / fraud detection (PDF or Excel)
+
+Risk Tiers (Contract & Cost):
+  HIGH        > $100,000 USD
+  MEDIUM      > $50,000  USD
+  LOW         > $1,000   USD
+  NEGLIGIBLE  ≤ $1,000   USD
+"""
+
+import io
+import json
+import re
+import hashlib
+import requests
+import unicodedata
+
+import fitz          # PyMuPDF
+import pandas as pd
+import streamlit as st
+
+# ── openpyxl (graceful fallback) ─────────────────────────────────────────────
+try:
+    import openpyxl          # noqa: F401  – used implicitly via pandas
+    OPENPYXL_OK = True
+except ImportError:
+    OPENPYXL_OK = False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 0.  PAGE CONFIG & GLOBAL CSS
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Petromax AI — Assurance Platform",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown("""
+<style>
+/* ── Google Font ── */
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+
+:root {
+    --navy:   #0B1D3A;
+    --steel:  #1A3254;
+    --gold:   #D4A017;
+    --amber:  #F59E0B;
+    --red:    #DC2626;
+    --orange: #EA580C;
+    --green:  #16A34A;
+    --slate:  #94A3B8;
+    --white:  #F8FAFC;
+    --card:   #152744;
+    --border: #1E3A5F;
+}
+
+html, body, [class*="css"] {
+    font-family: 'Sora', sans-serif;
+    background: var(--navy);
+    color: var(--white);
+}
+
+/* sidebar */
+[data-testid="stSidebar"] {
+    background: var(--steel) !important;
+    border-right: 1px solid var(--border);
+}
+[data-testid="stSidebar"] * { color: var(--white) !important; }
+
+/* headings */
+h1, h2, h3, h4 { font-family: 'Sora', sans-serif; font-weight: 700; }
+
+/* main title */
+.main-title {
+    font-size: 2.1rem;
+    font-weight: 700;
+    color: var(--gold);
+    letter-spacing: 0.5px;
+    margin-bottom: 0;
+    line-height: 1.2;
+}
+.main-subtitle {
+    font-size: 0.9rem;
+    color: var(--slate);
+    margin-top: 4px;
+    margin-bottom: 24px;
+}
+
+/* metric cards */
+.kpi-row { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 20px; }
+.kpi-card {
+    flex: 1 1 130px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+    text-align: center;
+    min-width: 110px;
+}
+.kpi-card .kpi-val {
+    font-size: 2rem;
+    font-weight: 700;
+    line-height: 1;
+    font-family: 'JetBrains Mono', monospace;
+}
+.kpi-card .kpi-lbl {
+    font-size: 0.72rem;
+    color: var(--slate);
+    margin-top: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+}
+.kpi-high   .kpi-val { color: var(--red);    }
+.kpi-med    .kpi-val { color: var(--orange); }
+.kpi-low    .kpi-val { color: var(--amber);  }
+.kpi-neg    .kpi-val { color: var(--green);  }
+.kpi-total  .kpi-val { color: var(--gold);   }
+
+/* risk badge */
+.badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    font-family: 'JetBrains Mono', monospace;
+}
+.badge-high   { background: #7F1D1D; color: #FCA5A5; }
+.badge-med    { background: #7C2D12; color: #FED7AA; }
+.badge-low    { background: #78350F; color: #FDE68A; }
+.badge-neg    { background: #14532D; color: #86EFAC; }
+.badge-dup    { background: #1E1B4B; color: #A5B4FC; }
+.badge-fraud  { background: #4C1D95; color: #DDD6FE; }
+
+/* table */
+.styled-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+    background: var(--card);
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+}
+.styled-table th {
+    background: var(--steel);
+    color: var(--gold);
+    padding: 10px 14px;
+    text-align: left;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    border-bottom: 1px solid var(--border);
+}
+.styled-table td {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+    color: var(--white);
+}
+.styled-table tr:last-child td { border-bottom: none; }
+.styled-table tr:hover td { background: rgba(255,255,255,0.03); }
+
+/* section header */
+.section-hdr {
+    background: var(--steel);
+    border-left: 4px solid var(--gold);
+    padding: 8px 16px;
+    border-radius: 0 6px 6px 0;
+    margin: 20px 0 12px 0;
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: var(--gold);
+}
+
+/* upload zone */
+[data-testid="stFileUploader"] {
+    background: var(--card) !important;
+    border: 1.5px dashed var(--border) !important;
+    border-radius: 10px !important;
+    padding: 10px !important;
+}
+
+/* buttons */
+.stButton button {
+    background: var(--gold) !important;
+    color: var(--navy) !important;
+    font-weight: 700 !important;
+    border: none !important;
+    border-radius: 8px !important;
+    font-family: 'Sora', sans-serif !important;
+    letter-spacing: 0.3px !important;
+}
+.stButton button:hover {
+    background: var(--amber) !important;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(212,160,23,0.3) !important;
+}
+
+/* info/warning boxes */
+.info-box {
+    background: rgba(26,50,84,0.7);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 0.82rem;
+    color: var(--slate);
+    margin-bottom: 12px;
+}
+
+/* progress bar override */
+[data-testid="stProgressBar"] div { background: var(--gold) !important; }
+
+/* tabs */
+[data-baseweb="tab-list"] { background: var(--card) !important; border-radius: 10px; }
+[data-baseweb="tab"] { color: var(--slate) !important; font-family: 'Sora', sans-serif !important; }
+[aria-selected="true"] { color: var(--gold) !important; font-weight: 600 !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  CONSTANTS & HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+# ── Preferred model order (updated May 2026) ─────────────────────────────────
+# gemini-3.5-flash  → current stable flagship (Google AI docs May 2026)
+# gemini-2.5-flash  → stable alias (no preview suffix needed since GA)
+# gemini-2.5-flash-preview-05-20 → explicit preview pin as extra fallback
+# Auto-discovery appended at runtime via _discover_gemini_models()
+GEMINI_MODELS_PREFERRED = [
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-preview-05-20",
+]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _discover_gemini_models(api_key: str) -> list[str]:
+    """
+    Call ListModels to get every model that supports generateContent.
+    Returns a list of model IDs sorted so flash/text models come first.
+    Falls back to GEMINI_MODELS_PREFERRED silently on any error.
+    """
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}&pageSize=100"
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            return GEMINI_MODELS_PREFERRED
+        models = r.json().get("models", [])
+        candidates = []
+        for m in models:
+            name = m.get("name", "")          # "models/gemini-2.5-flash"
+            methods = m.get("supportedGenerationMethods", [])
+            if "generateContent" not in methods:
+                continue
+            model_id = name.replace("models/", "")
+            # skip image / audio / embedding / code-only models
+            if any(skip in model_id for skip in
+                   ["image", "audio", "embed", "aqa", "vision",
+                    "tts", "video", "live", "it-"]):
+                continue
+            candidates.append(model_id)
+
+        # sort: prefer flash text models, newest versions first
+        def _rank(mid: str) -> tuple:
+            is_flash  = "flash" in mid
+            is_pro    = "pro" in mid
+            # extract leading version number for rough recency sort
+            nums = re.findall(r"(\d+)\.?(\d*)", mid)
+            major = int(nums[0][0]) if nums else 0
+            minor = int(nums[0][1]) if nums and nums[0][1] else 0
+            preview_pen = 1 if "preview" in mid else 0
+            return (-major, -minor, preview_pen, not is_flash, not is_pro)
+
+        candidates.sort(key=_rank)
+        # always keep our known-good models at the front
+        merged = GEMINI_MODELS_PREFERRED + [
+            c for c in candidates if c not in GEMINI_MODELS_PREFERRED
+        ]
+        return merged
+    except Exception:
+        return GEMINI_MODELS_PREFERRED
+
+RISK_TIERS = {
+    "HIGH":       (100_000, "#DC2626", "badge-high"),
+    "MEDIUM":     (50_000,  "#EA580C", "badge-med"),
+    "LOW":        (1_000,   "#F59E0B", "badge-low"),
+    "NEGLIGIBLE": (0,       "#16A34A", "badge-neg"),
+}
+
+# 30 cost-assurance ideas from our spreadsheet
+COST_ASSURANCE_IDEAS = [
+    "AI Duplicate Invoice Detection",
+    "Fuzzy Matching Across Invoice Fields",
+    "Overbilling Line-Item Analysis",
+    "Quantity Verification vs PO",
+    "Statistical Anomaly Detection on Invoice Amounts",
+    "Automated Rate Card Enforcement",
+    "Contract Clause Extraction with NLP",
+    "Spend vs Budget Threshold Alerts",
+    "Expiry & Renewal Risk Monitoring",
+    "SLA Penalty Auto-Calculation",
+    "Intelligent Document Capture (OCR + AI)",
+    "Auto-Coding GL Account Classification",
+    "Invoice Header vs Line-Item Reconciliation",
+    "Currency & FX Rate Validation",
+    "Tax Compliance & VAT Validation",
+    "Benford's Law Analysis on Invoice Amounts",
+    "Vendor Master Data Anomaly Detection",
+    "Employee-Vendor Relationship Mapping",
+    "Velocity & Frequency Anomaly Alerts",
+    "Round-Number Invoice Flagging",
+    "Tail Spend Consolidation via AI Clustering",
+    "Price Benchmarking Against Market Data",
+    "Early Payment Discount Optimisation",
+    "Retrospective Spend Audit with AI",
+    "Preferred Supplier Compliance Monitoring",
+    "Risk-Based Invoice Routing",
+    "PO Compliance & Maverick Buying Detection",
+    "Dynamic Discount & Penalty Recalculation",
+    "Continuous Controls Monitoring (CCM)",
+    "Supplier Self-Service Portal with AI Validation",
+]
+
+# 20 contract-assurance ideas from our spreadsheet
+CONTRACT_ASSURANCE_IDEAS = [
+    "AI Contract Risk Scoring",
+    "Automatic Clause Comparison to Playbook",
+    "Missing Clause Detection",
+    "Price Escalation Clause Analysis",
+    "Obligation Extraction & Tracking",
+    "Real-Time Contract Spend Tracking",
+    "Automatic Renewal & Termination Alerts",
+    "Rebate & Volume Discount Tracking",
+    "SLA Performance vs Contract Benchmarks",
+    "Change Order Analysis & Scope Creep Detection",
+    "Cross-Contract Inconsistency Detection",
+    "Liability Cap Extraction & Aggregation",
+    "Most-Favoured-Nation (MFN) Clause Enforcement",
+    "Contract-to-Invoice Semantic Matching",
+    "Warranty & Guarantee Tracking",
+    "Predictive Spend Forecasting from Contracts",
+    "Counterparty Financial Health Monitoring",
+    "Force Majeure & Penalty Clause Modelling",
+    "Contract Language Benchmarking vs Industry",
+    "Automated Audit Right Utilisation",
+]
+
+
+def tier_for_amount(amount: float) -> str:
+    if amount > 100_000: return "HIGH"
+    if amount > 50_000:  return "MEDIUM"
+    if amount > 1_000:   return "LOW"
+    return "NEGLIGIBLE"
+
+
+def badge_html(tier: str) -> str:
+    css = {"HIGH": "badge-high", "MEDIUM": "badge-med",
+           "LOW": "badge-low", "NEGLIGIBLE": "badge-neg"}.get(tier, "badge-neg")
+    return f'<span class="badge {css}">{tier}</span>'
+
+
+def extract_pdf_text(uploaded_file) -> str:
+    data = uploaded_file.read()
+    doc = fitz.open(stream=data, filetype="pdf")
+    return "".join(p.get_text() for p in doc)
+
+
+def call_gemini(prompt: str, api_key: str) -> str:
+    """
+    Try each model in the discovered list.
+    Skips 404 (model not found) and 429 (quota) gracefully.
+    Raises RuntimeError only when every model is exhausted.
+    """
+    models = _discover_gemini_models(api_key)
+    last_err = ""
+    tried = 0
+
+    for model_id in models:
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{model_id}:generateContent?key={api_key}")
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.15, "maxOutputTokens": 8192},
+        }
+        try:
+            r = requests.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=120,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                raw = data["candidates"][0]["content"]["parts"][0]["text"]
+                # strip any accidental markdown fences
+                raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
+                raw = re.sub(r"\n?```$", "", raw.strip())
+                return raw.strip()
+
+            # 404 → model doesn't exist, try next silently
+            if r.status_code == 404:
+                last_err = f"{model_id}: not found (404) — trying next model"
+                tried += 1
+                continue
+
+            # 429 → quota, try next
+            if r.status_code == 429:
+                last_err = f"{model_id}: quota exceeded (429)"
+                tried += 1
+                continue
+
+            # 400 → bad request — could be prompt too long, don't retry all
+            if r.status_code == 400:
+                err_msg = r.json().get("error", {}).get("message", r.text[:300])
+                raise RuntimeError(f"Bad request to {model_id}: {err_msg}")
+
+            last_err = f"{model_id} HTTP {r.status_code}: {r.text[:300]}"
+            tried += 1
+
+        except RuntimeError:
+            raise
+        except requests.exceptions.Timeout:
+            last_err = f"{model_id}: request timed out"
+            tried += 1
+        except Exception as e:
+            last_err = f"{model_id}: {e}"
+            tried += 1
+
+    raise RuntimeError(
+        f"All {tried} Gemini models failed.\n"
+        f"Last error: {last_err}\n\n"
+        f"Tip: Check your API key is valid and the Generative Language API "
+        f"is enabled at console.cloud.google.com/apis/library/generativelanguage.googleapis.com"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  CONTRACT ASSURANCE LOGIC
+# ─────────────────────────────────────────────────────────────────────────────
+CONTRACT_PROMPT = """You are a senior contract risk auditor. Analyze the contract below.
+
+Return ONLY a raw JSON array (no markdown, no backticks, no explanation).
+Produce exactly 10 risk observations. Each object must have EXACTLY these keys:
+  "Observation"      – max 30 words, name the specific clause or issue
+  "Clause_Reference" – section or article number if identifiable, else "General"
+  "Risk_Scenario"    – max 60 words, describe the business/financial risk
+  "Estimated_Exposure_USD" – integer estimate of maximum USD financial exposure (e.g. 250000)
+  "Risk_Tier"        – one of: HIGH / MEDIUM / LOW / NEGLIGIBLE
+                       (HIGH > $100k, MEDIUM > $50k, LOW > $1k, NEGLIGIBLE ≤ $1k)
+  "Mitigation_Plan"  – max 60 words, concrete action to mitigate
+  "Assurance_Technique" – which AI technique from the list below best applies
+
+AI Assurance Techniques to reference:
+{techniques}
+
+CONTRACT TEXT (first 22000 chars):
+{text}
+"""
+
+def run_contract_audit(text: str, api_key: str) -> list[dict]:
+    techniques = "\n".join(f"- {t}" for t in CONTRACT_ASSURANCE_IDEAS)
+    prompt = CONTRACT_PROMPT.format(techniques=techniques, text=text[:22000])
+    raw = call_gemini(prompt, api_key)
+    data = json.loads(raw)
+    # normalise / fill defaults
+    for row in data:
+        try:
+            row["Estimated_Exposure_USD"] = int(str(row.get("Estimated_Exposure_USD", 0))
+                                                 .replace(",", "").replace("$", ""))
+        except Exception:
+            row["Estimated_Exposure_USD"] = 0
+        row["Risk_Tier"] = tier_for_amount(row["Estimated_Exposure_USD"])
+    return data
+
+
+def render_contract_dashboard(data: list[dict]):
+    counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0, "NEGLIGIBLE": 0}
+    total_exposure = 0
+    for r in data:
+        t = r.get("Risk_Tier", "NEGLIGIBLE")
+        counts[t] = counts.get(t, 0) + 1
+        total_exposure += r.get("Estimated_Exposure_USD", 0)
+
+    st.markdown('<div class="section-hdr">📊 Risk Dashboard</div>', unsafe_allow_html=True)
+    kpi_html = '<div class="kpi-row">'
+    kpi_html += f'''
+    <div class="kpi-card kpi-total">
+        <div class="kpi-val">${total_exposure:,.0f}</div>
+        <div class="kpi-lbl">Total Exposure (USD)</div>
+    </div>
+    <div class="kpi-card kpi-high">
+        <div class="kpi-val">{counts["HIGH"]}</div>
+        <div class="kpi-lbl">High Risk (&gt;$100k)</div>
+    </div>
+    <div class="kpi-card kpi-med">
+        <div class="kpi-val">{counts["MEDIUM"]}</div>
+        <div class="kpi-lbl">Medium Risk (&gt;$50k)</div>
+    </div>
+    <div class="kpi-card kpi-low">
+        <div class="kpi-val">{counts["LOW"]}</div>
+        <div class="kpi-lbl">Low Risk (&gt;$1k)</div>
+    </div>
+    <div class="kpi-card kpi-neg">
+        <div class="kpi-val">{counts["NEGLIGIBLE"]}</div>
+        <div class="kpi-lbl">Negligible (≤$1k)</div>
+    </div>'''
+    kpi_html += '</div>'
+    st.markdown(kpi_html, unsafe_allow_html=True)
+
+    # risk bar chart
+    tier_order = ["HIGH", "MEDIUM", "LOW", "NEGLIGIBLE"]
+    chart_data = pd.DataFrame({
+        "Risk Tier": tier_order,
+        "Count":     [counts[t] for t in tier_order],
+        "Color":     ["#DC2626", "#EA580C", "#F59E0B", "#16A34A"],
+    })
+    # simple streamlit bar via metric-style display
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.markdown("**Risk Distribution**")
+        for _, row in chart_data.iterrows():
+            pct = (row["Count"] / max(len(data), 1)) * 100
+            st.markdown(
+                f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">'
+                f'<span style="width:80px;font-size:0.75rem;color:var(--slate);">{row["Risk Tier"]}</span>'
+                f'<div style="flex:1;background:var(--border);border-radius:4px;height:18px;overflow:hidden;">'
+                f'<div style="width:{pct:.0f}%;background:{row["Color"]};height:100%;border-radius:4px;'
+                f'transition:width 0.5s;"></div></div>'
+                f'<span style="width:24px;text-align:right;font-family:JetBrains Mono;font-size:0.8rem;">'
+                f'{int(row["Count"])}</span></div>',
+                unsafe_allow_html=True,
+            )
+    with col2:
+        high_exposure = sum(r.get("Estimated_Exposure_USD", 0)
+                            for r in data if r.get("Risk_Tier") == "HIGH")
+        st.metric("🔴 High-Risk Exposure", f"${high_exposure:,.0f}")
+        med_exposure = sum(r.get("Estimated_Exposure_USD", 0)
+                           for r in data if r.get("Risk_Tier") == "MEDIUM")
+        st.metric("🟠 Medium-Risk Exposure", f"${med_exposure:,.0f}")
+
+
+def render_contract_table(data: list[dict]):
+    st.markdown('<div class="section-hdr">📋 Detailed Risk Observations</div>',
+                unsafe_allow_html=True)
+
+    # sort by exposure descending
+    sorted_data = sorted(data, key=lambda x: x.get("Estimated_Exposure_USD", 0), reverse=True)
+
+    rows_html = ""
+    for i, r in enumerate(sorted_data, 1):
+        tier = r.get("Risk_Tier", "NEGLIGIBLE")
+        exp  = r.get("Estimated_Exposure_USD", 0)
+        rows_html += f"""
+        <tr>
+          <td style="font-family:JetBrains Mono;color:var(--slate);font-size:0.75rem;">{i:02d}</td>
+          <td><strong>{r.get('Observation','—')}</strong><br>
+              <span style="font-size:0.72rem;color:var(--slate);">§ {r.get('Clause_Reference','—')}</span></td>
+          <td>{badge_html(tier)}<br>
+              <span style="font-family:JetBrains Mono;font-size:0.78rem;color:{'#FCA5A5' if tier=='HIGH' else '#FDE68A'};">
+              ${exp:,.0f}</span></td>
+          <td style="color:#CBD5E1;">{r.get('Risk_Scenario','—')}</td>
+          <td style="color:#A5F3FC;font-size:0.78rem;">{r.get('Mitigation_Plan','—')}</td>
+          <td style="color:var(--slate);font-size:0.72rem;font-style:italic;">{r.get('Assurance_Technique','—')}</td>
+        </tr>"""
+
+    table_html = f"""
+    <table class="styled-table">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Observation / Clause</th>
+          <th>Risk Tier & Exposure</th>
+          <th>Risk Scenario</th>
+          <th>Mitigation Plan</th>
+          <th>AI Technique</th>
+        </tr>
+      </thead>
+      <tbody>{rows_html}</tbody>
+    </table>"""
+    st.markdown(table_html, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  COST ASSURANCE / INVOICE LOGIC
+# ─────────────────────────────────────────────────────────────────────────────
+def read_invoice_file(uploaded_file) -> pd.DataFrame:
+    """Parse PDF or Excel invoice file into a DataFrame."""
+    fname = uploaded_file.name.lower()
+
+    if fname.endswith(".pdf"):
+        text = extract_pdf_text(uploaded_file)
+        # Ask Gemini to extract invoice lines
+        return None, text   # signal: need AI extraction
+
+    # Excel / CSV
+    if fname.endswith((".xlsx", ".xls")):
+        if not OPENPYXL_OK:
+            st.error("openpyxl not installed — cannot read .xlsx files.")
+            return None, None
+        df = pd.read_excel(uploaded_file, engine="openpyxl")
+    elif fname.endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+    else:
+        st.error("Unsupported file type. Upload PDF, Excel, or CSV.")
+        return None, None
+
+    return df, None
+
+
+INVOICE_EXTRACT_PROMPT = """Extract all invoice records from the text below.
+Return ONLY a raw JSON array (no markdown, no backticks).
+Each object must have EXACTLY these keys:
+  "Invoice_Number"   – string
+  "Vendor"           – string
+  "Date"             – string (YYYY-MM-DD if possible)
+  "Amount_USD"       – float
+  "Description"      – string (max 20 words)
+  "PO_Number"        – string or "N/A"
+
+TEXT:
+{text}
+"""
+
+INVOICE_AUDIT_PROMPT = """You are a senior forensic accounts payable auditor with expertise in all 30 cost assurance techniques.
+Analyze these invoice records for duplicates, fraud patterns, and anomalies.
+
+Cost Assurance Techniques to apply:
+{techniques}
+
+Risk Tiers:
+  HIGH       > $100,000 USD
+  MEDIUM     > $50,000  USD
+  LOW        > $1,000   USD
+  NEGLIGIBLE ≤ $1,000   USD
+
+Invoice data (JSON):
+{invoices}
+
+Return ONLY a raw JSON array of findings. Each object must have EXACTLY:
+  "Finding_Type"      – one of: DUPLICATE / POTENTIAL_FRAUD / OVERBILLING / ANOMALY / RATE_VIOLATION / TAX_ISSUE
+  "Invoice_Numbers"   – comma-separated list of affected invoice numbers
+  "Vendor"            – vendor name
+  "Amount_USD"        – total amount at risk (float)
+  "Risk_Tier"         – HIGH / MEDIUM / LOW / NEGLIGIBLE
+  "Description"       – max 60 words explaining the finding
+  "Technique_Used"    – which cost assurance technique from the list above
+  "Recommended_Action"– max 40 words
+"""
+
+def run_invoice_audit_ai(invoices_json: str, api_key: str) -> list[dict]:
+    techniques = "\n".join(f"- {t}" for t in COST_ASSURANCE_IDEAS)
+    prompt = INVOICE_AUDIT_PROMPT.format(
+        techniques=techniques,
+        invoices=invoices_json[:18000]
+    )
+    raw = call_gemini(prompt, api_key)
+    data = json.loads(raw)
+    for row in data:
+        try:
+            row["Amount_USD"] = float(str(row.get("Amount_USD", 0))
+                                      .replace(",", "").replace("$", ""))
+        except Exception:
+            row["Amount_USD"] = 0.0
+        row["Risk_Tier"] = tier_for_amount(row["Amount_USD"])
+    return data
+
+
+def rule_based_duplicates(df: pd.DataFrame) -> list[dict]:
+    """Fast rule-based duplicate / anomaly scan on structured DataFrame."""
+    findings = []
+    df_clean = df.copy()
+
+    # normalise column names
+    df_clean.columns = [str(c).strip().lower().replace(" ", "_") for c in df_clean.columns]
+
+    # candidate amount columns
+    amt_col = next((c for c in df_clean.columns
+                    if any(k in c for k in ["amount", "total", "value", "sum", "usd", "price"])), None)
+    inv_col = next((c for c in df_clean.columns
+                    if any(k in c for k in ["invoice", "inv_no", "inv_num", "number", "ref"])), None)
+    vendor_col = next((c for c in df_clean.columns
+                       if any(k in c for k in ["vendor", "supplier", "payee", "company"])), None)
+    date_col = next((c for c in df_clean.columns
+                     if any(k in c for k in ["date", "invoice_date", "dt"])), None)
+
+    if amt_col:
+        df_clean["_amount_num"] = pd.to_numeric(df_clean[amt_col], errors="coerce").fillna(0)
+    else:
+        df_clean["_amount_num"] = 0.0
+
+    # 1. Exact amount + vendor duplicates
+    if amt_col and vendor_col:
+        dup_cols = [c for c in [vendor_col, amt_col, date_col] if c]
+        grp = df_clean.groupby(dup_cols)
+        for key, grp_df in grp:
+            if len(grp_df) > 1:
+                total = float(grp_df["_amount_num"].sum())
+                inv_nums = (df_clean.loc[grp_df.index, inv_col].tolist()
+                            if inv_col else grp_df.index.tolist())
+                findings.append({
+                    "Finding_Type": "DUPLICATE",
+                    "Invoice_Numbers": ", ".join(str(x) for x in inv_nums),
+                    "Vendor": str(key[0]) if isinstance(key, tuple) else str(key),
+                    "Amount_USD": total,
+                    "Risk_Tier": tier_for_amount(total),
+                    "Description": f"Exact match on vendor + amount{' + date' if date_col else ''}. {len(grp_df)} invoices for ${total:,.2f}.",
+                    "Technique_Used": "AI Duplicate Invoice Detection",
+                    "Recommended_Action": "Hold payment and request vendor confirmation of unique invoice.",
+                })
+
+    # 2. Round-number flag (multiples of 1000 > 5000)
+    if amt_col:
+        round_mask = (df_clean["_amount_num"] > 5000) & (df_clean["_amount_num"] % 1000 == 0)
+        round_rows = df_clean[round_mask]
+        if not round_rows.empty:
+            for _, row in round_rows.iterrows():
+                amt = float(row["_amount_num"])
+                inv = str(row[inv_col]) if inv_col else "—"
+                ven = str(row[vendor_col]) if vendor_col else "—"
+                findings.append({
+                    "Finding_Type": "ANOMALY",
+                    "Invoice_Numbers": inv,
+                    "Vendor": ven,
+                    "Amount_USD": amt,
+                    "Risk_Tier": tier_for_amount(amt),
+                    "Description": f"Round-number invoice ${amt:,.0f} — possible threshold-splitting or estimate billing.",
+                    "Technique_Used": "Round-Number Invoice Flagging",
+                    "Recommended_Action": "Request detailed breakdown and supporting documentation.",
+                })
+
+    # 3. Just-below-threshold flag (within 2% below $10k, $25k, $50k, $100k)
+    thresholds = [10_000, 25_000, 50_000, 100_000]
+    for thresh in thresholds:
+        low = thresh * 0.98
+        mask = (df_clean["_amount_num"] >= low) & (df_clean["_amount_num"] < thresh)
+        sub_rows = df_clean[mask]
+        if not sub_rows.empty:
+            for _, row in sub_rows.iterrows():
+                amt = float(row["_amount_num"])
+                inv = str(row[inv_col]) if inv_col else "—"
+                ven = str(row[vendor_col]) if vendor_col else "—"
+                findings.append({
+                    "Finding_Type": "POTENTIAL_FRAUD",
+                    "Invoice_Numbers": inv,
+                    "Vendor": ven,
+                    "Amount_USD": amt,
+                    "Risk_Tier": tier_for_amount(amt),
+                    "Description": (f"Invoice ${amt:,.2f} is just below ${thresh:,} approval threshold "
+                                    f"(within 2%) — possible threshold-splitting."),
+                    "Technique_Used": "Benford's Law Analysis on Invoice Amounts",
+                    "Recommended_Action": f"Escalate to manager; check if series of invoices cumulatively exceed ${thresh:,}.",
+                })
+
+    # 4. Vendor frequency spike (>5 invoices from same vendor)
+    if vendor_col:
+        freq = df_clean[vendor_col].value_counts()
+        spikes = freq[freq > 5]
+        for vendor, count in spikes.items():
+            total = float(df_clean[df_clean[vendor_col] == vendor]["_amount_num"].sum())
+            findings.append({
+                "Finding_Type": "ANOMALY",
+                "Invoice_Numbers": "Multiple",
+                "Vendor": str(vendor),
+                "Amount_USD": total,
+                "Risk_Tier": tier_for_amount(total),
+                "Description": f"Vendor '{vendor}' has {count} invoices totalling ${total:,.2f} — high frequency alert.",
+                "Technique_Used": "Velocity & Frequency Anomaly Alerts",
+                "Recommended_Action": "Review vendor contract terms and validate all invoices against POs.",
+            })
+
+    return findings
+
+
+def render_cost_dashboard(findings: list[dict], df: pd.DataFrame | None):
+    counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0, "NEGLIGIBLE": 0}
+    type_counts = {}
+    total_at_risk = 0.0
+    for f in findings:
+        t = f.get("Risk_Tier", "NEGLIGIBLE")
+        counts[t] = counts.get(t, 0) + 1
+        total_at_risk += f.get("Amount_USD", 0)
+        ft = f.get("Finding_Type", "OTHER")
+        type_counts[ft] = type_counts.get(ft, 0) + 1
+
+    invoice_count = len(df) if df is not None else "—"
+
+    st.markdown('<div class="section-hdr">📊 Cost Assurance Dashboard</div>',
+                unsafe_allow_html=True)
+
+    kpi_html = '<div class="kpi-row">'
+    kpi_html += f'''
+    <div class="kpi-card kpi-total">
+        <div class="kpi-val">{invoice_count}</div>
+        <div class="kpi-lbl">Invoices Analysed</div>
+    </div>
+    <div class="kpi-card kpi-total">
+        <div class="kpi-val">{len(findings)}</div>
+        <div class="kpi-lbl">Total Findings</div>
+    </div>
+    <div class="kpi-card kpi-total">
+        <div class="kpi-val">${total_at_risk:,.0f}</div>
+        <div class="kpi-lbl">Amount at Risk (USD)</div>
+    </div>
+    <div class="kpi-card kpi-high">
+        <div class="kpi-val">{counts["HIGH"]}</div>
+        <div class="kpi-lbl">High (&gt;$100k)</div>
+    </div>
+    <div class="kpi-card kpi-med">
+        <div class="kpi-val">{counts["MEDIUM"]}</div>
+        <div class="kpi-lbl">Medium (&gt;$50k)</div>
+    </div>
+    <div class="kpi-card kpi-low">
+        <div class="kpi-val">{counts["LOW"]}</div>
+        <div class="kpi-lbl">Low (&gt;$1k)</div>
+    </div>
+    <div class="kpi-card kpi-neg">
+        <div class="kpi-val">{counts["NEGLIGIBLE"]}</div>
+        <div class="kpi-lbl">Negligible (≤$1k)</div>
+    </div>'''
+    kpi_html += '</div>'
+    st.markdown(kpi_html, unsafe_allow_html=True)
+
+    # finding type breakdown
+    if type_counts:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Finding Types**")
+            colors = {
+                "DUPLICATE": "#818CF8", "POTENTIAL_FRAUD": "#A78BFA",
+                "OVERBILLING": "#F87171", "ANOMALY": "#FCD34D",
+                "RATE_VIOLATION": "#F97316", "TAX_ISSUE": "#34D399",
+            }
+            total_f = max(len(findings), 1)
+            for ftype, cnt in sorted(type_counts.items(), key=lambda x: -x[1]):
+                pct = cnt / total_f * 100
+                color = colors.get(ftype, "#94A3B8")
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">'
+                    f'<span style="width:130px;font-size:0.73rem;color:var(--slate);">{ftype}</span>'
+                    f'<div style="flex:1;background:var(--border);border-radius:4px;height:16px;overflow:hidden;">'
+                    f'<div style="width:{pct:.0f}%;background:{color};height:100%;border-radius:4px;"></div>'
+                    f'</div><span style="width:20px;text-align:right;font-size:0.78rem;">{cnt}</span></div>',
+                    unsafe_allow_html=True,
+                )
+        with col2:
+            dup_amt = sum(f["Amount_USD"] for f in findings if f.get("Finding_Type") == "DUPLICATE")
+            fraud_amt = sum(f["Amount_USD"] for f in findings if f.get("Finding_Type") == "POTENTIAL_FRAUD")
+            st.metric("💜 Duplicate Exposure", f"${dup_amt:,.0f}")
+            st.metric("🟣 Fraud Risk Exposure", f"${fraud_amt:,.0f}")
+
+
+FINDING_COLORS = {
+    "DUPLICATE": "badge-dup", "POTENTIAL_FRAUD": "badge-fraud",
+    "OVERBILLING": "badge-high", "ANOMALY": "badge-low",
+    "RATE_VIOLATION": "badge-med", "TAX_ISSUE": "badge-neg",
+}
+
+def render_cost_table(findings: list[dict]):
+    st.markdown('<div class="section-hdr">🔍 Detailed Invoice Findings</div>',
+                unsafe_allow_html=True)
+    sorted_f = sorted(findings, key=lambda x: x.get("Amount_USD", 0), reverse=True)
+
+    rows_html = ""
+    for i, f in enumerate(sorted_f, 1):
+        tier = f.get("Risk_Tier", "NEGLIGIBLE")
+        ftype = f.get("Finding_Type", "—")
+        fc = FINDING_COLORS.get(ftype, "badge-neg")
+        amt = f.get("Amount_USD", 0)
+        rows_html += f"""
+        <tr>
+          <td style="font-family:JetBrains Mono;color:var(--slate);font-size:0.75rem;">{i:02d}</td>
+          <td><span class="badge {fc}">{ftype}</span></td>
+          <td style="font-family:JetBrains Mono;font-size:0.78rem;">{f.get('Invoice_Numbers','—')}</td>
+          <td><strong>{f.get('Vendor','—')}</strong></td>
+          <td>{badge_html(tier)}<br>
+              <span style="font-family:JetBrains Mono;font-size:0.78rem;color:#FDE68A;">${amt:,.0f}</span></td>
+          <td style="color:#CBD5E1;">{f.get('Description','—')}</td>
+          <td style="color:var(--slate);font-size:0.72rem;font-style:italic;">{f.get('Technique_Used','—')}</td>
+          <td style="color:#A5F3FC;font-size:0.78rem;">{f.get('Recommended_Action','—')}</td>
+        </tr>"""
+
+    table_html = f"""
+    <table class="styled-table">
+      <thead><tr>
+        <th>#</th><th>Finding Type</th><th>Invoice(s)</th><th>Vendor</th>
+        <th>Tier / Amount</th><th>Description</th><th>Technique</th><th>Action</th>
+      </tr></thead>
+      <tbody>{rows_html}</tbody>
+    </table>"""
+    st.markdown(table_html, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  DOWNLOAD HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def build_excel_download(df: pd.DataFrame, sheet_name: str) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  SIDEBAR
+# ─────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## ⚙️ Configuration")
+    api_key = st.text_input(
+        "Gemini API Key",
+        value="AQ.Ab8RN6IyyYHnkLdZR9quOaVIqdt40fv-QOqMokeC_GrtTpofqg",
+        type="password",
+        help="Google AI Studio API key — get free key at aistudio.google.com",
+    )
+
+    # ── Live model status ────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🤖 AI Model Status")
+    if api_key and len(api_key) > 10:
+        with st.spinner("Checking available models…"):
+            discovered = _discover_gemini_models(api_key)
+        primary = discovered[0] if discovered else "—"
+        st.markdown(
+            f'<div style="background:#0f2a1a;border:1px solid #16a34a;border-radius:8px;'
+            f'padding:10px 12px;font-size:0.8rem;">'
+            f'<span style="color:#86efac;font-weight:600;">✅ Active Model</span><br>'
+            f'<span style="color:#f8fafc;font-family:JetBrains Mono,monospace;font-size:0.75rem;">'
+            f'{primary}</span><br>'
+            f'<span style="color:#64748b;font-size:0.7rem;">{len(discovered)} model(s) available as fallback</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        if len(discovered) > 1:
+            with st.expander("All available fallback models"):
+                for m in discovered[:8]:
+                    st.markdown(f"`{m}`")
+    else:
+        st.warning("Enter API key to check models")
+
+    st.markdown("---")
+    st.markdown("### 📘 Risk Tiers")
+    st.markdown("""
+| Tier | Threshold |
+|------|-----------|
+| 🔴 HIGH | > $100,000 |
+| 🟠 MEDIUM | > $50,000 |
+| 🟡 LOW | > $1,000 |
+| 🟢 NEGLIGIBLE | ≤ $1,000 |
+""")
+    st.markdown("---")
+    st.markdown("### 🛠 Powered By")
+    st.markdown("""
+- 30 Cost Assurance techniques
+- 20 Contract Assurance techniques
+- Gemini AI + rule-based analytics
+- Coupa · Icertis · AppZen · Sirion
+    """)
+    st.markdown("---")
+    st.caption("Petromax AI Platform v2.1 · Auto model discovery")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  MAIN UI
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown('<div class="main-title">🛡️ Petromax AI — Assurance Platform</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="main-subtitle">Contract Risk Intelligence &amp; Invoice Cost Assurance · '
+    '50 AI techniques · Real-time risk classification</div>',
+    unsafe_allow_html=True,
+)
+
+tab_contract, tab_cost = st.tabs([
+    "📄  Contract Assurance",
+    "🧾  Cost Assurance (Invoices)",
+])
+
+# ── TAB 1: CONTRACT ASSURANCE ────────────────────────────────────────────────
+with tab_contract:
+    st.markdown('<div class="section-hdr">Upload Contract Document</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="info-box">Upload a contract PDF to identify risk clauses, missing protections, '
+        'financial exposure estimates, and AI-powered mitigation recommendations aligned to 20 contract '
+        'assurance techniques.</div>',
+        unsafe_allow_html=True,
+    )
+
+    contract_file = st.file_uploader(
+        "Contract PDF", type=["pdf"],
+        key="contract_upload",
+        label_visibility="collapsed",
+    )
+
+    if contract_file:
+        col_a, col_b, col_c = st.columns([2, 1, 4])
+        with col_a:
+            analyze_btn = st.button("🚀 Run Contract Audit", use_container_width=True)
+        with col_b:
+            st.markdown(f"**File:** `{contract_file.name}`")
+
+        if analyze_btn:
+            with st.spinner("Extracting text and running AI risk analysis…"):
+                try:
+                    text = extract_pdf_text(contract_file)
+                    if len(text.strip()) < 200:
+                        st.warning("PDF text is very short — it may be a scanned image. Results may be limited.")
+
+                    audit_data = run_contract_audit(text, api_key)
+
+                    # Dashboard
+                    render_contract_dashboard(audit_data)
+
+                    # Detail table
+                    render_contract_table(audit_data)
+
+                    # Downloads
+                    st.markdown('<div class="section-hdr">⬇️ Export Results</div>',
+                                unsafe_allow_html=True)
+                    df_out = pd.DataFrame(audit_data)
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        csv_bytes = df_out.to_csv(index=False).encode("utf-8")
+                        st.download_button("📥 Download CSV",  csv_bytes,
+                                           "petromax_contract_audit.csv", "text/csv",
+                                           use_container_width=True)
+                    with col2:
+                        if OPENPYXL_OK:
+                            xl_bytes = build_excel_download(df_out, "Contract Risk")
+                            st.download_button("📊 Download Excel", xl_bytes,
+                                               "petromax_contract_audit.xlsx",
+                                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                               use_container_width=True)
+
+                except json.JSONDecodeError:
+                    st.error("AI returned malformed JSON. Please retry — the model may have added extra text.")
+                except Exception as e:
+                    st.error(f"Audit failed: {e}")
+                    st.info("Check your API key and ensure the Gemini API is enabled.")
+
+# ── TAB 2: COST ASSURANCE ────────────────────────────────────────────────────
+with tab_cost:
+    st.markdown('<div class="section-hdr">Upload Invoice Data</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="info-box">Upload invoice files (PDF, Excel .xlsx, or CSV) to detect duplicates, '
+        'potential fraud, overbilling, threshold-splitting, and other anomalies using 30 AI-powered '
+        'cost assurance techniques. Multiple files accepted — they will be consolidated.</div>',
+        unsafe_allow_html=True,
+    )
+
+    invoice_files = st.file_uploader(
+        "Invoice files (PDF / Excel / CSV)",
+        type=["pdf", "xlsx", "xls", "csv"],
+        accept_multiple_files=True,
+        key="invoice_upload",
+        label_visibility="collapsed",
+    )
+
+    use_ai = st.checkbox(
+        "🤖 Also run AI deep-scan (slower but catches semantic duplicates & complex fraud patterns)",
+        value=True,
+    )
+
+    if invoice_files:
+        col_a, col_b = st.columns([2, 5])
+        with col_a:
+            run_cost_btn = st.button("🔍 Run Invoice Audit", use_container_width=True)
+        with col_b:
+            st.markdown(f"**{len(invoice_files)} file(s) uploaded:** " +
+                        ", ".join(f"`{f.name}`" for f in invoice_files))
+
+        if run_cost_btn:
+            all_dfs = []
+            all_texts = []
+
+            with st.spinner("Reading and consolidating invoice files…"):
+                for f in invoice_files:
+                    fname = f.name.lower()
+                    if fname.endswith(".pdf"):
+                        txt = extract_pdf_text(f)
+                        all_texts.append(txt)
+                    else:
+                        try:
+                            if fname.endswith((".xlsx", ".xls")):
+                                df_tmp = pd.read_excel(f, engine="openpyxl")
+                            else:
+                                df_tmp = pd.read_csv(f)
+                            df_tmp["_source_file"] = f.name
+                            all_dfs.append(df_tmp)
+                        except Exception as e:
+                            st.warning(f"Could not read `{f.name}`: {e}")
+
+            consolidated_df = pd.concat(all_dfs, ignore_index=True) if all_dfs else None
+            all_findings = []
+
+            # Rule-based scan on structured data
+            if consolidated_df is not None and not consolidated_df.empty:
+                with st.spinner("Running rule-based duplicate and anomaly detection…"):
+                    rb_findings = rule_based_duplicates(consolidated_df)
+                    all_findings.extend(rb_findings)
+                    st.success(f"✅ Rule-based scan complete — {len(rb_findings)} findings on "
+                               f"{len(consolidated_df)} structured invoice rows.")
+
+            # AI scan
+            if use_ai:
+                invoices_for_ai = []
+                if consolidated_df is not None and not consolidated_df.empty:
+                    invoices_for_ai.append(consolidated_df.head(200).to_json(orient="records"))
+                invoices_for_ai.extend(all_texts)
+
+                if invoices_for_ai:
+                    with st.spinner("Running AI deep-scan for semantic duplicates & fraud patterns…"):
+                        try:
+                            combined_input = "\n\n---\n\n".join(invoices_for_ai)[:22000]
+                            ai_findings = run_invoice_audit_ai(combined_input, api_key)
+                            all_findings.extend(ai_findings)
+                            st.success(f"✅ AI scan complete — {len(ai_findings)} additional findings.")
+                        except json.JSONDecodeError:
+                            st.warning("AI returned malformed JSON for invoice scan. Showing rule-based results only.")
+                        except Exception as e:
+                            st.warning(f"AI scan failed: {e}. Showing rule-based results only.")
+
+            if all_findings:
+                render_cost_dashboard(all_findings, consolidated_df)
+                render_cost_table(all_findings)
+
+                # Preview consolidated data
+                if consolidated_df is not None and not consolidated_df.empty:
+                    with st.expander("📊 View Consolidated Invoice Data"):
+                        st.dataframe(consolidated_df, use_container_width=True)
+
+                # Downloads
+                st.markdown('<div class="section-hdr">⬇️ Export Results</div>',
+                            unsafe_allow_html=True)
+                df_findings = pd.DataFrame(all_findings)
+                col1, col2 = st.columns(2)
+                with col1:
+                    csv_bytes = df_findings.to_csv(index=False).encode("utf-8")
+                    st.download_button("📥 Download Findings CSV", csv_bytes,
+                                       "petromax_invoice_findings.csv", "text/csv",
+                                       use_container_width=True)
+                with col2:
+                    if OPENPYXL_OK and consolidated_df is not None:
+                        buf = io.BytesIO()
+                        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                            df_findings.to_excel(writer, sheet_name="Findings", index=False)
+                            consolidated_df.to_excel(writer, sheet_name="All Invoices", index=False)
+                        st.download_button(
+                            "📊 Download Full Excel Report", buf.getvalue(),
+                            "petromax_invoice_report.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                        )
+            elif invoice_files:
+                st.info("No findings detected — invoices appear clean, or the file format could not be parsed.")
+                
+            
