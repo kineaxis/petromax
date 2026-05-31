@@ -914,7 +914,7 @@ with st.sidebar:
     st.markdown("## ⚙️ Configuration")
     api_key = st.text_input(
         "Gemini API Key",
-        value="AQ.Ab8RN6IyyYHnkLdZR9quOaVIqdt40fv-QOqMokeC_GrtTpofqg",
+        value="AQ.Ab8RN6Jeh6vQSnJe1yR3Y97EzfnGcEQj5dQ54Nut3fYi2YVWhg",
         type="password",
         help="Google AI Studio API key — get free key at aistudio.google.com",
     )
@@ -1158,4 +1158,3 @@ with tab_cost:
             elif invoice_files:
                 st.info("No findings detected — invoices appear clean, or the file format could not be parsed.")
                 
-            
